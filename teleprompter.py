@@ -97,6 +97,9 @@ class Teleprompter:
         self.cursor_blink_t = pygame.time.get_ticks()
         self.selection      = None   # None or ((l1,c1),(l2,c2)) normalized
 
+        self.flip_mode = 1   # 0=none  1=H  2=V  3=H+V
+        self.icon_font = self._make_font(20)
+
         self.running = True
 
     # ── Fonts ─────────────────────────────────────────────────────────────────
@@ -209,8 +212,63 @@ class Teleprompter:
         self.cursor_visible = True
         self.cursor_blink_t = pygame.time.get_ticks()
 
+    def _wrap_text(self, text, max_w):
+        if not text.strip():
+            return ['']
+        words = text.split(' ')
+        lines, current = [], ''
+        for word in words:
+            test = (current + ' ' + word).strip()
+            if self.font.size(test)[0] <= max_w:
+                current = test
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        return lines if lines else ['']
+
+    def _edit_display_lines(self):
+        """Returns list of (display_text, logical_idx, char_start) for wrapped edit mode."""
+        max_w = self.W - 2 * EDIT_MARGIN - 20
+        result = []
+        for orig_idx, line in enumerate(self.lines):
+            if self._is_rule(line) or self._header_level(line)[0] > 0 or not line.strip():
+                result.append((line, orig_idx, 0))
+            else:
+                words = line.split(' ')
+                current, start = '', 0
+                for word in words:
+                    test = (current + ' ' + word).strip()
+                    if self.font.size(test)[0] <= max_w:
+                        current = test
+                    else:
+                        if current:
+                            result.append((current, orig_idx, start))
+                            start += len(current) + 1
+                        current = word
+                result.append((current, orig_idx, start))
+        return result
+
+    def _run_lines(self):
+        max_w = self.W - 120
+        result = []
+        for line in self.lines:
+            if self._is_rule(line) or self._header_level(line)[0] > 0 or not line.strip():
+                result.append(line)
+            else:
+                result.extend(self._wrap_text(line, max_w))
+        return result
+
     def _max_scroll(self):
-        return max(0.0, (len(self.lines) - 1) * self.font.get_linesize())
+        if self.mode == 'run':
+            n = len(self._run_lines())
+        elif self.mode == 'edit':
+            n = len(self._edit_display_lines())
+        else:
+            n = len(self.lines)
+        return max(0.0, (n - 1) * self.font.get_linesize())
 
     def _scroll_to_cursor(self):
         line_h = self.font.get_linesize()
@@ -337,7 +395,7 @@ class Teleprompter:
             cx += ts.get_width()
         return cx
 
-    def _render_line_edit(self, surf, line, y, line_idx):
+    def _render_line_edit(self, surf, line, y, line_idx, char_start=0):
         line_h = self.font.get_linesize()
         self._draw_selection(surf, line, y, line_idx)
 
@@ -369,10 +427,12 @@ class Teleprompter:
             segs = self._parse_inline_edit(line)
             self._blit_segments(surf, segs, EDIT_MARGIN, y)
 
-        # Cursor — measured on raw text with base font for consistency
+        # Cursor — only draw on the visual segment that contains cursor_col
         if line_idx == self.cursor_line and self.cursor_visible:
-            cursor_x = EDIT_MARGIN + self.font.size(line[:self.cursor_col])[0]
-            pygame.draw.rect(surf, WHITE, (cursor_x, y + 2, 2, line_h - 4))
+            local_col = self.cursor_col - char_start
+            if 0 <= local_col <= len(line):
+                cursor_x = EDIT_MARGIN + self.font.size(line[:local_col])[0]
+                pygame.draw.rect(surf, WHITE, (cursor_x, y + 2, 2, line_h - 4))
 
     def _render_line_run(self, surf, line, y):
         line_h = self.font.get_linesize()
@@ -423,6 +483,42 @@ class Teleprompter:
         pygame.draw.rect(surf, (30, 30, 30), (bar_x, 0, 6, self.H))
         pygame.draw.rect(surf, (90, 90, 90), (bar_x, thumb_y, 6, thumb_h), border_radius=3)
 
+    def _flip_prev_rect(self):
+        return pygame.Rect(self.W - 170, self.H - 90, 40, 52)
+
+    def _flip_next_rect(self):
+        return pygame.Rect(self.W - 58, self.H - 90, 40, 52)
+
+    def _draw_flip_btn(self, surf):
+        prev = self._flip_prev_rect()
+        nxt  = self._flip_next_rect()
+        mid_y = prev.y + prev.h // 2
+
+        for rect, char in ((prev, "◄"), (nxt, "►")):
+            pygame.draw.rect(surf, (60, 60, 60), rect, border_radius=6)
+            pygame.draw.rect(surf, GRAY, rect, 1, border_radius=6)
+            t = self.ui_font.render(char, True, WHITE)
+            surf.blit(t, (rect.x + (rect.w - t.get_width()) // 2,
+                          rect.y + (rect.h - t.get_height()) // 2))
+
+        icon = self.icon_font.render("A", True, WHITE)
+        if self.flip_mode == 1:
+            icon = pygame.transform.flip(icon, True,  False)
+        elif self.flip_mode == 2:
+            icon = pygame.transform.flip(icon, False, True)
+        elif self.flip_mode == 3:
+            icon = pygame.transform.flip(icon, True,  True)
+
+        labels = {0: "off", 1: "H", 2: "V", 3: "H+V"}
+        mode_lbl = self.hud_font.render(labels[self.flip_mode], True, GRAY)
+
+        gap_x  = prev.right + 4
+        gap_w  = nxt.x - prev.right - 8
+        icon_x = gap_x + (gap_w - icon.get_width()) // 2
+        lbl_x  = gap_x + (gap_w - mode_lbl.get_width()) // 2
+        surf.blit(icon,     (icon_x, mid_y - icon.get_height() - 1))
+        surf.blit(mode_lbl, (lbl_x,  mid_y + 2))
+
     def _start_btn_rect(self):
         label = self.ui_font.render("START  (Ctrl+Alt+Enter)", True, WHITE)
         bw = label.get_width() + 30
@@ -460,24 +556,38 @@ class Teleprompter:
 
         self._draw_highlight_band(surf, hl_y, hl_h)
 
+        if self.mode == 'run':
+            draw_lines = [(line, 0, 0) for line in self._run_lines()]
+        else:
+            draw_lines = self._edit_display_lines()
+
         surf.set_clip(pygame.Rect(EDIT_MARGIN, 0, self.W - 2 * EDIT_MARGIN, self.H))
-        for i, line in enumerate(self.lines):
+        for i, (line, logical_idx, char_start) in enumerate(draw_lines):
             y = hl_y + i * line_h - int(self.scroll_y)
             if y < -line_h:
                 continue
             if y > self.H + line_h:
                 break
             if self.mode == 'edit':
-                self._render_line_edit(surf, line, y, i)
+                self._render_line_edit(surf, line, y, logical_idx, char_start)
             else:
                 self._render_line_run(surf, line, y)
         surf.set_clip(None)
 
         if self.mode == 'run':
-            surf = pygame.transform.flip(surf, True, False)
+            if self.flip_mode == 1:
+                surf = pygame.transform.flip(surf, True,  False)
+            elif self.flip_mode == 2:
+                surf = pygame.transform.flip(surf, False, True)
+            elif self.flip_mode == 3:
+                surf = pygame.transform.flip(surf, True,  True)
 
         # HUD
-        cur_line = min(len(self.lines), int(self.scroll_y / line_h) + 1)
+        if self.mode == 'run':
+            hud_n = len(self._run_lines())
+        else:
+            hud_n = len(self._edit_display_lines())
+        cur_line = min(hud_n, int(self.scroll_y / line_h) + 1)
         pos = self.hud_font.render(f"Line {cur_line} / {len(self.lines)}", True, DIM_GRAY)
         spd = self.hud_font.render(f"Speed: {self.speed:.1f}", True, GRAY)
         fsz = self.hud_font.render(f"Font: {self.font_size}", True, DIM_GRAY)
@@ -488,11 +598,12 @@ class Teleprompter:
 
         if self.mode == 'edit':
             lbl = self.hud_font.render(
-                "EDIT — Ctrl+O: open  |  Ctrl+V: paste  |  Ctrl+A: select all  |  Ctrl+Q: quit",
+                "EDIT — Ctrl+O: open  |  Ctrl+V: paste  |  Ctrl+A: select all  |  M: mirror  |  Ctrl+Q: quit",
                 True, DIM_GRAY
             )
             surf.blit(lbl, (18, 14))
             self._draw_font_controls(surf)
+            self._draw_flip_btn(surf)
             btn = self._start_btn_rect()
             pygame.draw.rect(surf, DARK_GREEN, btn, border_radius=8)
             pygame.draw.rect(surf, BTN_GREEN,  btn, 2, border_radius=8)
@@ -518,24 +629,25 @@ class Teleprompter:
             return
         self.scroll_y = max(0.0, min(
             self.scroll_y + self.direction * self.speed,
-            max(0.0, (len(self.lines) - 1) * self.font.get_linesize())
+            self._max_scroll()
         ))
 
     # ── Events ────────────────────────────────────────────────────────────────
 
     def _click_to_cursor(self, mx, my):
-        line_h  = self.font.get_linesize()
-        hl_y    = int(self.H * HIGHLIGHT_RATIO)
-        clicked = max(0, min(int((my - hl_y + self.scroll_y) / line_h), len(self.lines) - 1))
-        self.cursor_line = clicked
-        line    = self.lines[clicked]
-        rel_x   = mx - EDIT_MARGIN
+        line_h       = self.font.get_linesize()
+        hl_y         = int(self.H * HIGHLIGHT_RATIO)
+        disp         = self._edit_display_lines()
+        vis_idx      = max(0, min(int((my - hl_y + self.scroll_y) / line_h), len(disp) - 1))
+        line, logical_idx, char_start = disp[vis_idx]
+        self.cursor_line = logical_idx
+        rel_x        = mx - EDIT_MARGIN
         best_col, best_dist = 0, float('inf')
         for i in range(len(line) + 1):
             dist = abs(self.font.size(line[:i])[0] - rel_x)
             if dist < best_dist:
                 best_dist, best_col = dist, i
-        self.cursor_col = best_col
+        self.cursor_col = char_start + best_col
         self._cursor_reset_blink()
 
     def _handle_events(self):
@@ -559,6 +671,10 @@ class Teleprompter:
                     mx, my = event.pos
                     if self._start_btn_rect().collidepoint((mx, my)):
                         self.mode = 'run'
+                    elif self._flip_next_rect().collidepoint((mx, my)):
+                        self.flip_mode = (self.flip_mode + 1) % 4
+                    elif self._flip_prev_rect().collidepoint((mx, my)):
+                        self.flip_mode = (self.flip_mode - 1) % 4
                     elif self._font_minus_rect().collidepoint((mx, my)):
                         self.font_size = max(FONT_SIZE_MIN, self.font_size - FONT_SIZE_STEP)
                         self._reload_fonts()
@@ -653,6 +769,8 @@ class Teleprompter:
                     elif k in (pygame.K_MINUS, pygame.K_KP_MINUS):
                         self.font_size = max(FONT_SIZE_MIN, self.font_size - FONT_SIZE_STEP)
                         self._reload_fonts()
+                    elif k == pygame.K_m:
+                        self.flip_mode = (self.flip_mode + 1) % 4
 
                 elif self.mode == 'run':
                     if k == pygame.K_ESCAPE:
